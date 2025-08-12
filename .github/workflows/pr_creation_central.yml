@@ -2,34 +2,99 @@ name: Central Terraform PR Creation Pipeline
 
 on:
   pull_request:
-    types:
-      - opened
-      - synchronize
-    branches:
-      - main
+    types: [opened, synchronize]
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   get_checkov_skips:
     runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Get details of checkov skip checks
-        id: get_checkov_skips
-        run: |
-          cfg_content=$(grep -v '^#' checkov_skips.cfg | tr -d '\r\n')
-          echo "checkov_skips=$cfg_content" >> $GITHUB_OUTPUT
-    
     outputs:
-      checkov_skip_checks: ${{ steps.get_checkov_skips.outputs.checkov_skips }}
+      checkov_skip_checks: ${{ steps.get.outputs.skips }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: get
+        run: |
+          if [ -f checkov_skips.cfg ]; then
+            cfg_content=$(grep -v '^#' checkov_skips.cfg | tr -d '\r\n')
+          else
+            cfg_content=""
+          fi
+          echo "skips=$cfg_content" >> "$GITHUB_OUTPUT"
 
-  trigger_central_pr_plan_pipeline_reusable_workflow:
-    uses: McCainFoods/mf-core-pipelines/.github/workflows/iac-terraform-pr-create.yaml@main
-    secrets: inherit
+  detect_envs:
+    name: Detect env folders (changed or all)
+    runs-on: ubuntu-latest
     needs: get_checkov_skips
+    outputs:
+      env_json: ${{ steps.out.outputs.env_json }}
+      count: ${{ steps.out.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      # PRs: use tj-actions to get top-level dirs that changed and contain *.tf / *.tfvars
+      - name: Changed files → top-level dirs (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        id: cf
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            **/*.tf
+            **/*.tfvars
+          dir_names: true
+          dir_names_max_depth: 1
+          json: true
+
+      # Manual runs: list all top-level dirs that have Terraform files
+      - name: All env dirs (manual)
+        if: ${{ github.event_name != 'pull_request' }}
+        id: manual
+        shell: bash
+        run: |
+          dirs=$(find . -maxdepth 1 -mindepth 1 -type d \
+            | grep -vE '^\./(\.git|\.github|\.config|\.terraform)' \
+            | sed 's|^\./||' \
+            | while read d; do
+                find "$d" -maxdepth 1 -type f \( -name '*.tf' -o -name '*.tfvars' \) | grep -q . && echo "$d" || true
+              done)
+          if [ -z "$dirs" ]; then
+            echo '[]' > envs.json
+          else
+            printf '%s\n' $dirs | sort -u | jq -R . | jq -s . > envs.json
+          fi
+          echo "json=$(cat envs.json)" >> "$GITHUB_OUTPUT"
+
+      # Normalize & sort to a single JSON output
+      - name: Normalize outputs
+        id: out
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            raw='${{ steps.cf.outputs.all_changed_files_json || '[]' }}'
+          else
+            raw='${{ steps.manual.outputs.json || '[]' }}'
+          fi
+          # Sort & ensure array
+          echo "$raw" | jq -S 'unique' > envs.json
+          echo "env_json=$(cat envs.json)" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq 'length' envs.json)" >> "$GITHUB_OUTPUT"
+          echo "Detected envs: $(cat envs.json)"
+
+  plan_per_env:
+    name: Plan (${{ matrix.env }})
+    needs: [get_checkov_skips, detect_envs]
+    if: needs.detect_envs.outputs.count != '0'
+    uses: pathakas/mf-core-pipelines/.github/workflows/iac-terraform-pr-create.yaml@main
+    secrets: inherit
+    strategy:
+      fail-fast: false
+      max-parallel: 1        # ← sequential: first run depends on get_checkov_skips; next waits for previous
+      matrix:
+        env: ${{ fromJSON(needs.detect_envs.outputs.env_json) }}
     with:
       triggered_by: "${{ github.repository }}"
       pr_event: "terraform-iac-pr-plan"
@@ -40,3 +105,4 @@ jobs:
       commit_sha: "${{ github.sha }}"
       branch: "${{ github.head_ref || github.ref_name }}"
       checkov_skip_checks: "${{ needs.get_checkov_skips.outputs.checkov_skip_checks }}"
+      working_dir: "${{ matrix.env }}"   # central reusable should use as working-directory for TF steps
