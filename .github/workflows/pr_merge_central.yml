@@ -1,0 +1,41 @@
+name: Central Terraform PR Merge Pipeline
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  get_checkov_skips:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get details of checkov skip checks
+        id: get_checkov_skips
+        run: |
+          cfg_content=$(grep -v '^#' checkov_skips.cfg | tr -d '\r\n')
+          echo "checkov_skips=$cfg_content" >> $GITHUB_OUTPUT
+
+    outputs:
+      checkov_skip_checks: ${{ steps.get_checkov_skips.outputs.checkov_skips }}
+
+  trigger_central_pr_apply_pipeline_reusable_workflow:
+    uses: McCainFoods/mf-core-pipelines/.github/workflows/iac-terraform-pr-merge.yaml@main
+    secrets: inherit
+    needs: get_checkov_skips
+    with:
+      triggered_by: "${{ github.repository }}"
+      pr_event: "terraform-iac-pr-apply"
+      pr_event_action: "${{ github.event.action }}"
+      pr_event_name: "${{ github.event_name }}"
+      run_id: "${{ github.run_id }}"
+      pr_number: "${{ github.event.pull_request.number }}"
+      commit_sha: "${{ github.sha }}"
+      branch: "${{ github.head_ref || github.ref_name }}"
+      checkov_skip_checks: "${{ needs.get_checkov_skips.outputs.checkov_skip_checks }}"
