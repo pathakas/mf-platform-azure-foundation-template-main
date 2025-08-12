@@ -1,8 +1,8 @@
 terraform {
   cloud {
-    organization = "Mccain_Foods"
+    organization = "{{ TFE_ORGANIZATION }}"
     workspaces {
-      name = "parameter-foundation-workspace-name"
+      name = "{{ TFE_WORKSPACE_NAME }}"
     }
   }
 }
