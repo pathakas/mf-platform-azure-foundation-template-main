@@ -1,6 +1,6 @@
 terraform {
   cloud {
-    organization = "{{ TFE_ORGANIZATION }}"
+    organization = "example-org-feb65b"
     workspaces {
       name = "{{ TFE_WORKSPACE_NAME }}"
     }
