@@ -6,8 +6,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The called workflow requests these; grant them here (or scope at job level if preferred)
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
+  id-token: write
 
 jobs:
   get_checkov_skips:
@@ -36,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      # PRs: use tj-actions to get top-level dirs that changed and contain *.tf / *.tfvars
+      # PRs: get top-level dirs that changed and contain *.tf / *.tfvars
       - name: Changed files → top-level dirs (PR)
         if: ${{ github.event_name == 'pull_request' }}
         id: cf
@@ -78,7 +81,6 @@ jobs:
           else
             raw='${{ steps.manual.outputs.json || '[]' }}'
           fi
-          # Sort & ensure array
           echo "$raw" | jq -S 'unique' > envs.json
           echo "env_json=$(cat envs.json)" >> "$GITHUB_OUTPUT"
           echo "count=$(jq 'length' envs.json)" >> "$GITHUB_OUTPUT"
@@ -92,7 +94,7 @@ jobs:
     secrets: inherit
     strategy:
       fail-fast: false
-      max-parallel: 1        # ← sequential: first run depends on get_checkov_skips; next waits for previous
+      max-parallel: 1
       matrix:
         env: ${{ fromJSON(needs.detect_envs.outputs.env_json) }}
     with:
@@ -105,4 +107,4 @@ jobs:
       commit_sha: "${{ github.sha }}"
       branch: "${{ github.head_ref || github.ref_name }}"
       checkov_skip_checks: "${{ needs.get_checkov_skips.outputs.checkov_skip_checks }}"
-      working_dir: "${{ matrix.env }}"   # central reusable should use as working-directory for TF steps
+      working_dir: "${{ matrix.env }}"   # <- consumed by the reusable workflow
