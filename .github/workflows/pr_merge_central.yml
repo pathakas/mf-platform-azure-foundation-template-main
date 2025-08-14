@@ -8,34 +8,202 @@ on:
       - main
   workflow_dispatch:
 
+# The called workflow requests these; grant them here (or scope at job level if preferred)
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
 jobs:
   get_checkov_skips:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Get details of checkov skip checks
         id: get_checkov_skips
         run: |
-          cfg_content=$(grep -v '^#' checkov_skips.cfg | tr -d '\r\n')
+          if [ -f checkov_skips.cfg ]; then
+            cfg_content=$(grep -v '^#' checkov_skips.cfg | tr -d '\r\n')
+          else
+            cfg_content=""
+          fi
           echo "checkov_skips=$cfg_content" >> $GITHUB_OUTPUT
-
     outputs:
       checkov_skip_checks: ${{ steps.get_checkov_skips.outputs.checkov_skips }}
 
-  trigger_central_pr_apply_pipeline_reusable_workflow:
-    uses: McCainFoods/mf-core-pipelines/.github/workflows/iac-terraform-pr-merge.yaml@main
-    secrets: inherit
+  detect_envs:
+    name: Detect env folders (changed or all)
+    runs-on: ubuntu-latest
     needs: get_checkov_skips
-    with:
-      triggered_by: "${{ github.repository }}"
-      pr_event: "terraform-iac-pr-apply"
-      pr_event_action: "${{ github.event.action }}"
-      pr_event_name: "${{ github.event_name }}"
-      run_id: "${{ github.run_id }}"
-      pr_number: "${{ github.event.pull_request.number }}"
-      commit_sha: "${{ github.sha }}"
-      branch: "${{ github.head_ref || github.ref_name }}"
-      checkov_skip_checks: "${{ needs.get_checkov_skips.outputs.checkov_skip_checks }}"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # PRs: get top-level dirs that changed and contain *.tf / *.tfvars
+      - name: Changed files → top-level dirs (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        id: cf
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            **/*.tf
+            **/*.tfvars
+          dir_names: true
+          dir_names_max_depth: 1
+          json: true
+
+      # Manual runs: list all top-level dirs that have Terraform files
+      - name: All env dirs (manual)
+        if: ${{ github.event_name != 'pull_request' }}
+        id: manual
+        shell: bash
+        run: |
+          dirs=$(find . -maxdepth 1 -mindepth 1 -type d \
+            | grep -vE '^\./(\.git|\.github|\.config|\.terraform)' \
+            | sed 's|^\./||' \
+            | while read d; do
+                find "$d" -maxdepth 1 -type f \( -name '*.tf' -o -name '*.tfvars' \) | grep -q . && echo "$d" || true
+              done)
+          
+          if [ -z "$dirs" ]; then
+            echo '[]' > envs.json
+          else
+            printf '%s\n' $dirs | sort -u | jq -R . | jq -s . > envs.json
+          fi
+          echo "json=$(cat envs.json)" >> $GITHUB_OUTPUT
+
+      # Normalize & sort to a single JSON output
+      - name: Normalize outputs
+        id: out
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            raw='${{ steps.cf.outputs.all_changed_files_json || '[]' }}'
+          else
+            raw='${{ steps.manual.outputs.json || '[]' }}'
+          fi
+          echo "$raw" | jq -S 'unique' > envs.json
+          echo "env_json=$(cat envs.json)" >> $GITHUB_OUTPUT
+          echo "count=$(jq 'length' envs.json)" >> $GITHUB_OUTPUT
+          
+          # Create space-separated list for easier iteration
+          env_list=$(echo "$raw" | jq -r '.[]' | tr '\n' ' ' | sed 's/ $//')
+          echo "env_list=$env_list" >> $GITHUB_OUTPUT
+          echo "Detected envs: $(cat envs.json)"
+          echo "Env list: $env_list"
+    outputs:
+      env_json: ${{ steps.out.outputs.env_json }}
+      count: ${{ steps.out.outputs.count }}
+      env_list: ${{ steps.out.outputs.env_list }}
+
+  # Sequential dispatch jobs - dynamically created with proper dependencies
+  create_sequential_dispatches:
+    name: Create Sequential Environment Dispatches
+    needs: [get_checkov_skips, detect_envs]
+    if: needs.detect_envs.outputs.count != '0'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Create Repository Dispatches Sequentially
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ENV_LIST: ${{ needs.detect_envs.outputs.env_list }}
+          CHECKOV_SKIPS: ${{ needs.get_checkov_skips.outputs.checkov_skip_checks }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Function to create repository dispatch
+          create_dispatch() {
+            local env="$1"
+            local depends_on="$2"
+            local step_number="$3"
+            
+            echo "🚀 Creating dispatch for environment: $env"
+            echo "   Dependencies: $depends_on"
+            echo "   Step: $step_number"
+            
+            # Create payload
+            payload=$(jq -n \
+              --arg env "$env" \
+              --arg depends_on "$depends_on" \
+              --arg step_num "$step_number" \
+              --arg repo "$REPO" \
+              --arg checkov_skips "$CHECKOV_SKIPS" \
+              --arg pr_number "$PR_NUMBER" \
+              --arg commit_sha "$COMMIT_SHA" \
+              --arg branch "$BRANCH" \
+              --arg run_id "$RUN_ID" \
+              --arg event_action "$EVENT_ACTION" \
+              --arg event_name "$EVENT_NAME" \
+              '{
+                environment: $env,
+                working_dir: $env,
+                depends_on: $depends_on,
+                step_number: ($step_num | tonumber),
+                triggered_by: $repo,
+                pr_event: "terraform-iac-pr-apply",
+                pr_event_action: $event_action,
+                pr_event_name: $event_name,
+                run_id: $run_id,
+                pr_number: $pr_number,
+                commit_sha: $commit_sha,
+                branch: $branch,
+                checkov_skip_checks: $checkov_skips
+              }')
+            
+            # Send dispatch
+            curl -X POST \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              https://api.github.com/repos/$REPO/dispatches \
+              -d "{\"event_type\":\"terraform-apply-$env\",\"client_payload\":$payload}"
+            
+            echo "✅ Dispatch created for: $env"
+            sleep 1  # Small delay between dispatches
+          }
+
+          echo "🎯 Starting sequential dispatch creation..."
+          echo "Environments to process: $ENV_LIST"
+          
+          # Convert space-separated list to array
+          envs=($ENV_LIST)
+          previous_env=""
+          step_counter=1
+          
+          for env in "${envs[@]}"; do
+            if [ -z "$previous_env" ]; then
+              # First environment depends on get_checkov_skips
+              depends_on="get_checkov_skips"
+            else
+              # Subsequent environments depend on previous environment
+              depends_on="dispatch_$previous_env"
+            fi
+            
+            create_dispatch "$env" "$depends_on" "$step_counter"
+            previous_env="$env"
+            ((step_counter++))
+          done
+          
+          echo "🎉 All sequential dispatches created!"
+          echo "🔗 Dependency chain created:"
+          
+          # Show the dependency chain
+          previous=""
+          for env in "${envs[@]}"; do
+            if [ -z "$previous" ]; then
+              echo "   get_checkov_skips → dispatch_$env"
+            else
+              echo "   dispatch_$previous → dispatch_$env"
+            fi
+            previous="$env"
+          done
